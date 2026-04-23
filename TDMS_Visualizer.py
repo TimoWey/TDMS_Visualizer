@@ -11,6 +11,7 @@ import pyqtgraph as pg
 pg.setConfigOptions(useOpenGL=False)
 import sys
 from functools import partial
+import re
 
 # Minimum horizontal space reserved for the plot; must match _CappedMinPlotWidget cap + MainWindow.
 PLOT_MIN_W = 200
@@ -268,6 +269,16 @@ class MainWindow(QMainWindow):
     def __init__(self, tdms):
         super(MainWindow, self).__init__()
         self.tdms = tdms
+        # TDMS_Viewer-like normalization/bundling:
+        # - groups like "Loop [3]" -> "Loop"
+        # - channels like "Torque 12:34:56.789" -> "Torque"
+        self._TRAILING_TIME_RE = re.compile(r"\s+\d{2}:\d{2}:\d{2}\.\d{3}$")
+        self._TRAILING_INDEX_RE = re.compile(r"\s*\[\d+\]$")
+
+        self._raw_groups_by_norm = {}
+        self._combined_by_norm = {}  # (normGroup, normChannel) -> list[(rawGroup, rawChannel)]
+        self._norm_channels_by_norm_group = {}  # normGroup -> sorted list[normChannel]
+        self._build_normalized_index()
 
         self.legendFontSize = 7
 
@@ -369,17 +380,47 @@ class MainWindow(QMainWindow):
         # (see _CappedMinPlotWidget: pyqtgraph's own hint is ignored for the sum).
         central.setMinimumWidth(self._sidebar_w + self._plot_min_w)
 
+        self.plottedData = {}
         self.initComboBox()
-        self.setButtonLayout(self.tdms.tdms_file.groups()[0].name)
+        # Default to the first normalized group
+        first_norm = next(iter(self._raw_groups_by_norm.keys()), None)
+        if first_norm is not None:
+            self.setButtonLayout(first_norm)
 
         self.setCentralWidget(central)
-
-        self.plottedData = {}
         self.showMaximized()
 
+    def _normalize_group_name(self, name: str) -> str:
+        return self._TRAILING_INDEX_RE.sub("", str(name)).strip()
+
+    def _normalize_channel_name(self, name: str) -> str:
+        return self._TRAILING_TIME_RE.sub("", str(name)).strip()
+
+    def _build_normalized_index(self):
+        raw_groups_by_norm = {}
+        combined = {}
+        norm_channels_by_group = {}
+
+        for g in self.tdms.tdms_file.groups():
+            ng = self._normalize_group_name(g.name)
+            raw_groups_by_norm.setdefault(ng, []).append(g.name)
+            for ch in g.channels():
+                if ch.name == "time":
+                    continue
+                nc = self._normalize_channel_name(ch.name)
+                combined.setdefault((ng, nc), []).append((g.name, ch.name))
+
+        for ng in raw_groups_by_norm.keys():
+            chans = sorted({nc for (gk, nc) in combined.keys() if gk == ng}, key=str.lower)
+            norm_channels_by_group[ng] = chans
+
+        self._raw_groups_by_norm = dict(sorted(raw_groups_by_norm.items(), key=lambda kv: str(kv[0]).lower()))
+        self._combined_by_norm = combined
+        self._norm_channels_by_norm_group = norm_channels_by_group
+
     def initComboBox(self):
-        for group in self.tdms.tdms_file.groups():
-            self.comboBox.addItem(group.name)
+        for norm_group in self._raw_groups_by_norm.keys():
+            self.comboBox.addItem(norm_group)
         self.comboBox.setMinimumContentsLength(25)
         self.comboBox.currentIndexChanged.connect(self.comboBoxChange)
 
@@ -393,38 +434,115 @@ class MainWindow(QMainWindow):
         self.setButtonLayout(groupText)
     
     def setButtonLayout(self, groupText):
-        for channel in self.tdms.tdms_file[groupText].channels():
-            if channel.name == "time": continue
-            checkBox = QCheckBox(channel.name)
-            try:
-                self.plottedData[(groupText,channel.name)]
-                checkBox.setChecked(True)
-            except:
-                print(end='') #do nothing
-            self.buttonLayout.addWidget(checkBox)
-            checkBox.stateChanged.connect(partial(self.clicked, groupText, channel.name))
+        # groupText is a *normalized group* shown in the dropdown
+        for norm_ch in self._norm_channels_by_norm_group.get(groupText, []):
+            cb = QCheckBox(norm_ch)
+            if (groupText, norm_ch) in self.plottedData:
+                cb.setChecked(True)
+            self.buttonLayout.addWidget(cb)
+            cb.stateChanged.connect(partial(self.clicked, groupText, norm_ch))
 
     def clicked(self, groupText, channel):
-        if (groupText, channel) in list(self.plottedData.keys()): # used to be in selected, now deselected
-            plotInfo = self.plottedData.pop((groupText, channel))
+        # groupText is a normalized group, channel is a normalized channel.
+        key = (groupText, channel)
+        if key in self.plottedData:  # deselect
+            plotInfo = self.plottedData.pop(key)
+            item = plotInfo[0]
             if groupText in self.tdms.digital:
-                self.p2.removeItem(plotInfo[0])
-                self.legend.removeItem(plotInfo[0])
+                self.p2.removeItem(item)
+                try:
+                    self.legend.removeItem(item)
+                except Exception:
+                    pass
             else:
                 if len(plotInfo) > 4 and plotInfo[4].isChecked():
-                    self.p2.removeItem(plotInfo[0])
+                    self.p2.removeItem(item)
                 else:
-                    self.graphWidget.removeItem(plotInfo[0])
+                    self.graphWidget.removeItem(item)
             plotInfo[1].deleteLater()
             plotInfo[2].deleteLater()
             plotInfo[3].deleteLater()
             if len(plotInfo) > 4:
                 plotInfo[4].deleteLater()
-        else: 
-            plotItem = self.add_to_plot(groupText, channel)
-            self.plottedData[(groupText, channel)] = plotItem
-            self.j += 1
-            self.setInteraction(groupText, channel, plotItem, self.j)
+            return
+
+        # select: combine all matching raw channels into a single curve (TDMS_Viewer style)
+        entries = self._combined_by_norm.get(key, [])
+        segments = []  # list[(x, y)]
+        any_digital = False
+        any_nondigital = False
+        for raw_g, raw_ch in entries:
+            if raw_g in self.tdms.digital:
+                any_digital = True
+            else:
+                any_nondigital = True
+            try:
+                if raw_g in self.tdms.timesDict:
+                    x = self.convert_to_np(self.tdms.timesDict[raw_g])
+                else:
+                    x = self.convert_to_np(self.tdms.timesDict[(raw_g, raw_ch)])
+                y = self.convert_to_np(self.tdms.tdms_file[raw_g][raw_ch][:])
+                if raw_g in self.tdms.digital:
+                    y = self.adjust_digital(raw_ch, y)
+            except Exception:
+                continue
+            if x.size and y.size:
+                x = x.astype(float, copy=False)
+                segments.append((x, y))
+
+        if not segments:
+            return
+
+        # Order segments by their own start time, then concatenate with NaN separators
+        # to prevent pyqtgraph from drawing long lines between distant segments.
+        def _seg_start(seg):
+            x, _ = seg
+            if x.size == 0:
+                return float("inf")
+            finite = x[np.isfinite(x)]
+            return float(finite[0]) if finite.size else float("inf")
+
+        segments.sort(key=_seg_start)
+
+        xs = []
+        ys = []
+        for i, (x, y) in enumerate(segments):
+            if i > 0:
+                xs.append(np.array([np.nan], dtype=float))
+                ys.append(np.array([np.nan], dtype=float))
+            xs.append(x)
+            ys.append(y)
+
+        x_plot = np.concatenate(xs)
+        y_plot = np.concatenate(ys)
+
+        legend_name = f"{groupText}: {channel}"
+        # If mixed digital/non-digital, keep on left axis (non-digital) to avoid forcing right.
+        plot_on_right = (any_digital and not any_nondigital)
+        if plot_on_right:
+            item = pg.PlotDataItem(
+                x=x_plot,
+                y=y_plot,
+                symbolBrush=pg.mkBrush('r'),
+                symbol=None,
+                pen=pg.mkPen('r', width=1),
+                name=legend_name,
+            )
+            self.p2.addItem(item)
+            self.legend.addItem(item, legend_name)
+        else:
+            item = self.graphWidget.plot(
+                x=x_plot,
+                y=y_plot,
+                symbolBrush=pg.mkBrush('r'),
+                symbol=None,
+                pen=pg.mkPen('r', width=1),
+                name=legend_name,
+            )
+
+        self.plottedData[key] = item
+        self.j += 1
+        self.setInteraction(groupText, channel, item, self.j)
 
     def initGraphWidget(self):
         self.j = -1
@@ -527,7 +645,7 @@ class MainWindow(QMainWindow):
                 _axis_lbl_to_html(t), color="k", size="16px"
             )
 
-    def add_to_plot(self, groupText, channelText):
+    def add_to_plot(self, groupText, channelText, display_name=None, add_legend=True):
         if groupText in self.tdms.timesDict:
             time = self.tdms.timesDict[groupText]
         else:
@@ -535,15 +653,17 @@ class MainWindow(QMainWindow):
         channel_info = self.tdms.tdms_file[groupText][channelText][:]
         np_channel_info = self.convert_to_np(channel_info)
         # print(groupText)
+        name = display_name if display_name is not None else (groupText + ": " + channelText)
         if groupText in self.tdms.digital:
             np_channel_info = self.adjust_digital(channelText, np_channel_info)
             plotDataItem = pg.PlotDataItem(x = self.convert_to_np(time), y = np_channel_info, symbolBrush = pg.mkBrush('r'),
-                                             symbol = None, pen=pg.mkPen('r', width = 1), name = groupText + ": " + channelText)
+                                             symbol = None, pen=pg.mkPen('r', width = 1), name = name)
             self.p2.addItem(plotDataItem)
-            self.legend.addItem(plotDataItem, groupText + ": " + channelText)
+            if add_legend and name is not None:
+                self.legend.addItem(plotDataItem, name)
         else:
             plotDataItem = self.graphWidget.plot(x = self.convert_to_np(time), y = np_channel_info, symbolBrush = pg.mkBrush('r'),
-                                             symbol = None, pen=pg.mkPen('r', width = 1), name = groupText + ": " + channelText)
+                                             symbol = None, pen=pg.mkPen('r', width = 1), name = name if add_legend else None)
         return plotDataItem
 
     def convert_to_np(self, data):
@@ -558,7 +678,7 @@ class MainWindow(QMainWindow):
         return np_channel_info
 
     def setInteraction(self, group, channel, plotDataItem, i):
-        label = QLabel(group + ":  " + channel) # group - channel
+        label = QLabel(group + ":  " + channel) # normalized group - normalized channel
         self.interLayout.addWidget(label, i, 0)
 
         button = QPushButton('Color', self)
@@ -574,7 +694,10 @@ class MainWindow(QMainWindow):
 
         axis_cb = QCheckBox("")
         axis_cb.blockSignals(True)
-        if group in self.tdms.digital:
+        # normalized group may map to raw digital groups; disable only if all raw groups are digital
+        raw_groups = self._raw_groups_by_norm.get(group, [])
+        all_digital = bool(raw_groups) and all(rg in self.tdms.digital for rg in raw_groups)
+        if all_digital:
             axis_cb.setEnabled(False)
             axis_cb.setChecked(True)
         else:
@@ -588,11 +711,14 @@ class MainWindow(QMainWindow):
     def toggle_y_axis(self, group, channel, state):
         if (group, channel) not in self.plottedData:
             return
-        if group in self.tdms.digital:
+        # Disable only if all raw groups in this normalized group are digital.
+        raw_groups = self._raw_groups_by_norm.get(group, [])
+        all_digital = bool(raw_groups) and all(rg in self.tdms.digital for rg in raw_groups)
+        if all_digital:
             return
-        item = self.plottedData[(group, channel)][0]
         main_vb = self.graphWidget.getPlotItem().getViewBox()
         use_right = (state == Qt.Checked)
+        item = self.plottedData[(group, channel)][0]
         if use_right:
             main_vb.removeItem(item)
             self.p2.addItem(item)
@@ -605,12 +731,14 @@ class MainWindow(QMainWindow):
 
     def set_color(self, group, channel):
         color = QColorDialog.getColor()
-        self.plottedData[(group,channel)][0].setSymbolBrush(color)
-        self.plottedData[(group,channel)][0].setPen(color, width = 1)
+        item = self.plottedData[(group, channel)][0]
+        item.setSymbolBrush(color)
+        item.setPen(color, width = 1)
     
     def set_shape(self, group, channel):
         shape_index = self.plottedData[(group, channel)][3].currentIndex()
-        self.plottedData[(group,channel)][0].setSymbol(self.shapes[shape_index])
+        item = self.plottedData[(group, channel)][0]
+        item.setSymbol(self.shapes[shape_index])
 
 def main():
     app = QApplication(sys.argv)
